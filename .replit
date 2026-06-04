@@ -1,0 +1,20 @@
+run = "npm run dev"
+entrypoint = "app/page.tsx"
+modules = ["nodejs-20"]
+
+hidden = [".next", "node_modules"]
+
+[nix]
+channel = "stable-24_05"
+
+[deployment]
+run = ["sh", "-c", "npm run build && npm run start"]
+build = ["sh", "-c", "npm run build"]
+deploymentTarget = "cloudrun"
+
+[[ports]]
+localPort = 3000
+externalPort = 80
+
+[env]
+NEXT_TELEMETRY_DISABLED = "1"
