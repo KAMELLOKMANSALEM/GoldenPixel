@@ -17,10 +17,11 @@ function mulberry32(seed: number) {
   };
 }
 
+// Grades of gold/yellow only — the demo wall reads as one warm tone, not a rainbow.
 const PALETTE = [
-  "#e0533d", "#2f6df0", "#11a36b", "#e8b53a", "#8b3df0", "#e2407f",
-  "#16b6c2", "#f0772f", "#a8c020", "#ff4d6d", "#3ad0a0", "#6aa3ff",
-  "#d94f9c", "#f2c14e", "#5b8c2a", "#c44dff",
+  "#d9b25b", "#e8c574", "#c79a3e", "#f0d896", "#b8862f", "#eac35e",
+  "#a87f2c", "#f5e6b8", "#caa24a", "#ddbb6b", "#9c7423", "#f2dca0",
+  "#e0bd66", "#bf963a", "#ecd189", "#cfa84a",
 ];
 
 // A small set of abstract SVG tiles (reused across blocks; the image cache loads
@@ -85,7 +86,7 @@ export function generateDummyWall(seed = 7): PublicBlock[] {
   const rand = mulberry32(seed);
   const taken = new Set<string>();
   const blocks: PublicBlock[] = [];
-  const targetCoverage = Math.floor(GRID.COLS * GRID.ROWS * 0.62);
+  const targetCoverage = Math.floor(GRID.COLS * GRID.ROWS * 0.28);
   let covered = 0;
   let attempts = 0;
 

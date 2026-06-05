@@ -85,18 +85,16 @@ export default function WallCanvas({
     ctx.fillStyle = "#0a0a0b";
     ctx.fillRect(0, 0, wallW, wallH);
 
-    ctx.strokeStyle = "rgba(255,255,255,0.04)";
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    for (let c = 0; c <= cols; c++) {
-      ctx.moveTo(c * cellSize + 0.5, 0);
-      ctx.lineTo(c * cellSize + 0.5, wallH);
-    }
+    // Dot grid — a faint dot at each cell corner; four dots frame one square.
+    ctx.fillStyle = "rgba(255,255,255,0.22)";
+    const dotR = Math.max(0.5, cellSize * 0.05);
     for (let r = 0; r <= rows; r++) {
-      ctx.moveTo(0, r * cellSize + 0.5);
-      ctx.lineTo(wallW, r * cellSize + 0.5);
+      for (let c = 0; c <= cols; c++) {
+        ctx.beginPath();
+        ctx.arc(c * cellSize, r * cellSize, dotR, 0, Math.PI * 2);
+        ctx.fill();
+      }
     }
-    ctx.stroke();
 
     for (const b of blocks) {
       const minRow = Math.min(...b.squares.map((s) => s.row));
