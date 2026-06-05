@@ -19,24 +19,24 @@ the real webhook/capture uses (no money moves).
 
 ---
 
-## 1. Supabase (database + image storage)  — required
+## 1. Database + image storage (Replit-native)  — required
 
-1. Create a project at https://supabase.com (free tier is fine).
-2. **Settings → API**: copy the **Project URL**, the **anon** key, and the
-   **service_role** key into `.env.local`:
-   ```
-   NEXT_PUBLIC_SUPABASE_URL=...
-   NEXT_PUBLIC_SUPABASE_ANON_KEY=...
-   SUPABASE_SERVICE_ROLE_KEY=...     # server-only secret — never expose
-   ```
-3. **SQL Editor → New query**: run the migrations IN ORDER, one at a time:
-   - `supabase/migrations/0001_init.sql`
-   - `supabase/migrations/0002_applications.sql`
-   - `supabase/migrations/0003_cell_images.sql`
-4. **Storage → New bucket**: name it `art`, mark it **Public**. (Matches
-   `SUPABASE_STORAGE_BUCKET=art`.)
+Everything lives inside your Repl — no external account.
 
-That alone makes the wall, funnel, admin, and edit pages run with real data.
+1. **Add a database:** in Replit, open **Tools → Database** (or "Add a database")
+   → **PostgreSQL**. Replit creates it and injects `DATABASE_URL` automatically.
+2. **Add object storage:** **Tools → Object Storage** → create the default bucket.
+   This is where uploaded artwork is stored (served via `/api/img/...`).
+3. **Run the migrations** once, from the Replit **Shell**:
+   ```bash
+   npm run migrate
+   ```
+   This applies `supabase/migrations/0001…0003` (tables + the SQL functions) to
+   your Replit database. (The folder is named `supabase/` for history; the SQL is
+   plain PostgreSQL and runs anywhere.)
+
+That alone makes the wall, funnel, admin, and edit pages run with real data —
+no keys to copy, no external dashboard.
 
 ## 2. Square (card / Apple Pay / Google Pay)  — required for live payment
 

@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getBlockRaw } from "@/lib/blocks";
-import { supabaseAdmin } from "@/lib/supabase/admin";
+import { db } from "@/lib/db";
 import { safeEqual } from "@/lib/tokens";
 import { MAX_CAPTION_LEN } from "@/lib/config";
 
@@ -37,11 +37,12 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "invalid link" }, { status: 400 });
   }
 
-  const { error } = await supabaseAdmin()
-    .from("blocks")
-    .update({ caption: caption || null, link_url: linkUrl || null })
-    .eq("id", blockId);
-  if (error) return NextResponse.json({ error: "update failed" }, { status: 500 });
+  try {
+    const sql = db();
+    await sql`update blocks set caption = ${caption || null}, link_url = ${linkUrl || null} where id = ${blockId}::uuid`;
+  } catch {
+    return NextResponse.json({ error: "update failed" }, { status: 500 });
+  }
 
   return NextResponse.json({ ok: true });
 }

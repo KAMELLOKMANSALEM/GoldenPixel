@@ -1,5 +1,5 @@
-// Server-side data access for the eligibility funnel. Service-role only.
-import { supabaseAdmin } from "./supabase/admin";
+// Server-side data access for the eligibility funnel, on Replit PostgreSQL.
+import { db, norm } from "./db";
 import { randomToken, safeEqual } from "./tokens";
 import type { BlockSize, BlockShape } from "./config";
 import type { Cell } from "./types";
@@ -26,7 +26,7 @@ export type ApplicationRow = {
   paid_at: string | null;
   image_url: string | null;
   original_image_url: string | null;
-  cell_images: (string | null)[] | null; // one image per cell, row-major
+  cell_images: (string | null)[] | null;
   caption: string | null;
   link_url: string | null;
   flagged: boolean;
@@ -48,41 +48,26 @@ export async function createApplication(params: {
   shape: BlockShape;
   amountCents: number;
 }): Promise<{ id: string; token: string }> {
-  const db = supabaseAdmin();
+  const sql = db();
   const token = randomToken();
-  const { data, error } = await db
-    .from("applications")
-    .insert({
-      email: params.email,
-      survey: params.survey,
-      size: params.size,
-      shape: params.shape,
-      amount_cents: params.amountCents,
-      status: "eligible",
-      access_token: token,
-    })
-    .select("id")
-    .single();
-  if (error) throw error;
-  return { id: data.id as string, token };
+  const rows = await sql`
+    insert into applications (email, survey, size, shape, amount_cents, status, access_token)
+    values (${params.email}, ${sql.json(params.survey as never)}, ${params.size}::smallint,
+            ${params.shape}, ${params.amountCents}::int, 'eligible', ${token})
+    returning id`;
+  return { id: rows[0].id as string, token };
 }
 
 export async function getApplication(id: string): Promise<ApplicationRow | null> {
-  const db = supabaseAdmin();
-  const { data, error } = await db.from("applications").select("*").eq("id", id).maybeSingle();
-  if (error) throw error;
-  return (data as ApplicationRow) ?? null;
+  const sql = db();
+  const rows = await sql`select * from applications where id = ${id}::uuid`;
+  return norm<ApplicationRow>(rows)[0] ?? null;
 }
 
 export async function getApplicationByPaymentRef(ref: string): Promise<ApplicationRow | null> {
-  const db = supabaseAdmin();
-  const { data, error } = await db
-    .from("applications")
-    .select("*")
-    .eq("payment_ref", ref)
-    .maybeSingle();
-  if (error) throw error;
-  return (data as ApplicationRow) ?? null;
+  const sql = db();
+  const rows = await sql`select * from applications where payment_ref = ${ref}`;
+  return norm<ApplicationRow>(rows)[0] ?? null;
 }
 
 export async function verifyAccess(id: string, token: string): Promise<ApplicationRow | null> {
@@ -91,45 +76,30 @@ export async function verifyAccess(id: string, token: string): Promise<Applicati
   return app;
 }
 
-// Record the chosen payment provider/order ref before redirecting to checkout,
-// so the webhook can map the payment back to the application.
 export async function setPaymentRef(
   id: string,
   provider: "square" | "paypal",
   ref: string
 ): Promise<void> {
-  const db = supabaseAdmin();
-  const { error } = await db
-    .from("applications")
-    .update({ payment_provider: provider, payment_ref: ref, updated_at: new Date().toISOString() })
-    .eq("id", id);
-  if (error) throw error;
+  const sql = db();
+  await sql`update applications set payment_provider = ${provider}, payment_ref = ${ref}, updated_at = now() where id = ${id}::uuid`;
 }
 
-// Flip eligible -> paid exactly once (idempotent for webhook retries).
 export async function confirmApplicationPaid(
   id: string,
   provider: "square" | "paypal",
   ref: string
 ): Promise<{ firstTime: boolean }> {
-  const db = supabaseAdmin();
-  const { data, error } = await db
-    .from("applications")
-    .update({
-      status: "paid",
-      payment_provider: provider,
-      payment_ref: ref,
-      paid_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-    })
-    .eq("id", id)
-    .eq("status", "eligible")
-    .select("id");
-  if (error) throw error;
-  return { firstTime: (data?.length ?? 0) > 0 };
+  const sql = db();
+  const rows = await sql`
+    update applications set
+      status = 'paid', payment_provider = ${provider}, payment_ref = ${ref},
+      paid_at = now(), updated_at = now()
+    where id = ${id}::uuid and status = 'eligible'
+    returning id`;
+  return { firstTime: rows.length > 0 };
 }
 
-// Attach the submitted artwork. Allowed while paid or re-submitting before review.
 export async function attachSubmission(
   id: string,
   fields: {
@@ -142,29 +112,19 @@ export async function attachSubmission(
     moderation: unknown;
   }
 ): Promise<boolean> {
-  const db = supabaseAdmin();
-  const { data, error } = await db
-    .from("applications")
-    .update({
-      image_url: fields.imageUrl,
-      original_image_url: fields.originalImageUrl,
-      caption: fields.caption,
-      link_url: fields.linkUrl,
-      email: fields.email,
-      flagged: fields.flagged,
-      moderation: fields.moderation,
-      status: "submitted",
-      updated_at: new Date().toISOString(),
-    })
-    .eq("id", id)
-    .in("status", ["paid", "submitted"])
-    .select("id");
-  if (error) throw error;
-  return (data?.length ?? 0) > 0;
+  const sql = db();
+  const rows = await sql`
+    update applications set
+      image_url = ${fields.imageUrl}, original_image_url = ${fields.originalImageUrl},
+      caption = ${fields.caption}, link_url = ${fields.linkUrl}, email = ${fields.email},
+      flagged = ${fields.flagged}, moderation = ${sql.json(fields.moderation as never)},
+      status = 'submitted', updated_at = now()
+    where id = ${id}::uuid and status in ('paid','submitted')
+    returning id`;
+  return rows.length > 0;
 }
 
 // Per-cell upload ("simulation module"): store one cell's image into the array.
-// Keeps a representative thumbnail in image_url and accumulates the flagged state.
 export async function setCellImage(
   id: string,
   cellIndex: number,
@@ -181,22 +141,17 @@ export async function setCellImage(
   while (arr.length < total) arr.push(null);
   arr[cellIndex] = url;
   const firstFilled = arr.find((u) => !!u) || url;
-  const db = supabaseAdmin();
-  const { error } = await db
-    .from("applications")
-    .update({
-      cell_images: arr,
-      image_url: firstFilled,
-      flagged: app.flagged || cellFlagged,
-      updated_at: new Date().toISOString(),
-    })
-    .eq("id", id);
-  if (error) throw error;
+  const sql = db();
+  await sql`
+    update applications set
+      cell_images = ${sql.json(arr as never)},
+      image_url = ${firstFilled},
+      flagged = ${app.flagged || cellFlagged},
+      updated_at = now()
+    where id = ${id}::uuid`;
   return true;
 }
 
-// Finalize the submission once every cell has an image: set caption/link/email
-// and move to `submitted`. Returns a reason when it can't proceed.
 export async function finalizeSubmission(
   id: string,
   fields: { caption: string | null; linkUrl: string; email: string },
@@ -207,38 +162,24 @@ export async function finalizeSubmission(
     return { ok: false, reason: "not-ready" };
   }
   const arr = Array.isArray(app.cell_images) ? (app.cell_images as (string | null)[]) : [];
-  const filled = arr.filter((u) => !!u).length;
-  if (filled < totalCells) return { ok: false, reason: "incomplete" };
-  const db = supabaseAdmin();
-  const { error } = await db
-    .from("applications")
-    .update({
-      caption: fields.caption,
-      link_url: fields.linkUrl,
-      email: fields.email,
-      status: "submitted",
-      updated_at: new Date().toISOString(),
-    })
-    .eq("id", id);
-  if (error) throw error;
+  if (arr.filter((u) => !!u).length < totalCells) return { ok: false, reason: "incomplete" };
+  const sql = db();
+  await sql`
+    update applications set
+      caption = ${fields.caption}, link_url = ${fields.linkUrl}, email = ${fields.email},
+      status = 'submitted', updated_at = now()
+    where id = ${id}::uuid`;
   return { ok: true };
 }
 
 export async function approveApplication(id: string, adminEmail: string): Promise<boolean> {
-  const db = supabaseAdmin();
-  const { data, error } = await db
-    .from("applications")
-    .update({
-      status: "approved",
-      reviewed_by: adminEmail,
-      reviewed_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-    })
-    .eq("id", id)
-    .eq("status", "submitted")
-    .select("id");
-  if (error) throw error;
-  return (data?.length ?? 0) > 0;
+  const sql = db();
+  const rows = await sql`
+    update applications set
+      status = 'approved', reviewed_by = ${adminEmail}, reviewed_at = now(), updated_at = now()
+    where id = ${id}::uuid and status = 'submitted'
+    returning id`;
+  return rows.length > 0;
 }
 
 export async function markRejected(
@@ -246,50 +187,35 @@ export async function markRejected(
   adminEmail: string,
   notes: string | null
 ): Promise<void> {
-  const db = supabaseAdmin();
-  const { error } = await db
-    .from("applications")
-    .update({
-      status: "rejected",
-      review_notes: notes,
-      reviewed_by: adminEmail,
-      reviewed_at: new Date().toISOString(),
-      refunded_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-    })
-    .eq("id", id);
-  if (error) throw error;
+  const sql = db();
+  await sql`
+    update applications set
+      status = 'rejected', review_notes = ${notes}, reviewed_by = ${adminEmail},
+      reviewed_at = now(), refunded_at = now(), updated_at = now()
+    where id = ${id}::uuid`;
 }
 
-// Place an approved application onto the wall. Returns:
-//   { ok:true } on publish, { ok:false, reason:'conflict' } if a cell was taken,
-//   { ok:false, reason:'state' } if not placeable.
 export async function placeApplication(
   id: string,
   cells: Cell[]
 ): Promise<{ ok: true; blockId: string } | { ok: false; reason: "conflict" | "state" }> {
-  const db = supabaseAdmin();
-  const { data, error } = await db.rpc("place_block", {
-    p_application_id: id,
-    p_cells: cells,
-  });
-  if (error) {
-    if ((error as { code?: string }).code === "23505") return { ok: false, reason: "conflict" };
-    throw error;
+  const sql = db();
+  try {
+    const rows = await sql`select * from place_block(${id}::uuid, ${JSON.stringify(cells)}::jsonb)`;
+    const block = norm<{ id: string }>(rows)[0];
+    if (!block?.id) return { ok: false, reason: "state" };
+    return { ok: true, blockId: block.id };
+  } catch (e) {
+    if ((e as { code?: string }).code === "23505") return { ok: false, reason: "conflict" };
+    throw e;
   }
-  if (!data) return { ok: false, reason: "state" };
-  return { ok: true, blockId: (data as { id: string }).id };
 }
 
-// Admin review queue: everything awaiting/decided, flagged + newest first.
 export async function listApplications(): Promise<ApplicationRow[]> {
-  const db = supabaseAdmin();
-  const { data, error } = await db
-    .from("applications")
-    .select("*")
-    .in("status", ["submitted", "approved", "rejected", "published", "refunded", "paid"])
-    .order("flagged", { ascending: false })
-    .order("created_at", { ascending: false });
-  if (error) throw error;
-  return (data as ApplicationRow[]) ?? [];
+  const sql = db();
+  const rows = await sql`
+    select * from applications
+    where status in ('submitted','approved','rejected','published','refunded','paid')
+    order by flagged desc, created_at desc`;
+  return norm<ApplicationRow>(rows);
 }

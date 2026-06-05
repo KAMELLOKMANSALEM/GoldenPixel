@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { getBlockRaw } from "@/lib/blocks";
 import { processAndStore } from "@/lib/image";
 import { moderateImage } from "@/lib/moderation";
-import { supabaseAdmin } from "@/lib/supabase/admin";
+import { db } from "@/lib/db";
 import { safeEqual } from "@/lib/tokens";
 import { MAX_UPLOAD_BYTES, ACCEPTED_MIME, type BlockShape } from "@/lib/config";
 
@@ -51,16 +51,16 @@ export async function POST(req: NextRequest) {
     crop,
   });
 
-  const { error } = await supabaseAdmin()
-    .from("blocks")
-    .update({
-      image_url: urls.imageUrl,
-      original_image_url: urls.originalImageUrl,
-      flagged: mod.flagged,
-      moderation: mod.detail,
-    })
-    .eq("id", blockId);
-  if (error) return NextResponse.json({ error: "update failed" }, { status: 500 });
+  try {
+    const sql = db();
+    await sql`
+      update blocks set
+        image_url = ${urls.imageUrl}, original_image_url = ${urls.originalImageUrl},
+        flagged = ${mod.flagged}, moderation = ${sql.json(mod.detail as never)}
+      where id = ${blockId}::uuid`;
+  } catch {
+    return NextResponse.json({ error: "update failed" }, { status: 500 });
+  }
 
   // A swap re-opens an unflagged block to review only if newly flagged.
   return NextResponse.json({ imageUrl: urls.imageUrl, flagged: mod.flagged });

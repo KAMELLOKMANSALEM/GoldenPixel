@@ -1,4 +1,4 @@
-import { supabaseAdmin } from "./supabase/admin";
+import { db, norm } from "./db";
 import { getBlockRaw } from "./blocks";
 import { releaseBlock } from "./release";
 import { refundSquarePayment } from "./payments/square";
@@ -24,34 +24,49 @@ export type AdminBlock = {
   paidAt: string | null;
 };
 
+type AdminBlockRow = {
+  id: string;
+  image_url: string | null;
+  cell_images: (string | null)[] | null;
+  caption: string | null;
+  link_url: string | null;
+  owner_email: string | null;
+  shape: string;
+  size: number;
+  flagged: boolean;
+  moderation: unknown;
+  status: "live" | "removed";
+  amount_cents: number;
+  payment_provider: string | null;
+  created_at: string;
+  paid_at: string | null;
+};
+
 // All sold blocks for the moderation queue. Flagged sorted to the top, newest first.
 export async function getAdminBlocks(): Promise<AdminBlock[]> {
-  const db = supabaseAdmin();
-  const { data, error } = await db
-    .from("blocks")
-    .select(
-      "id,image_url,cell_images,caption,link_url,owner_email,shape,size,flagged,moderation,status,amount_cents,payment_provider,created_at,paid_at"
-    )
-    .eq("state", "sold")
-    .order("flagged", { ascending: false })
-    .order("created_at", { ascending: false });
-  if (error) throw error;
-  return (data as Record<string, unknown>[]).map((r) => ({
-    id: r.id as string,
-    imageUrl: r.image_url as string | null,
-    cellImages: (r.cell_images as (string | null)[] | null) ?? null,
-    caption: r.caption as string | null,
-    linkUrl: r.link_url as string | null,
-    ownerEmail: r.owner_email as string | null,
-    shape: r.shape as string,
-    size: r.size as number,
-    flagged: r.flagged as boolean,
+  const sql = db();
+  const rows = await sql`
+    select id, image_url, cell_images, caption, link_url, owner_email, shape, size,
+           flagged, moderation, status, amount_cents, payment_provider, created_at, paid_at
+    from blocks
+    where state = 'sold'
+    order by flagged desc, created_at desc`;
+  return norm<AdminBlockRow>(rows).map((r) => ({
+    id: r.id,
+    imageUrl: r.image_url,
+    cellImages: r.cell_images ?? null,
+    caption: r.caption,
+    linkUrl: r.link_url,
+    ownerEmail: r.owner_email,
+    shape: r.shape,
+    size: r.size,
+    flagged: r.flagged,
     moderation: r.moderation,
-    status: r.status as "live" | "removed",
-    amountCents: r.amount_cents as number,
-    provider: r.payment_provider as string | null,
-    createdAt: r.created_at as string,
-    paidAt: r.paid_at as string | null,
+    status: r.status,
+    amountCents: r.amount_cents,
+    provider: r.payment_provider,
+    createdAt: r.created_at,
+    paidAt: r.paid_at,
   }));
 }
 
@@ -61,26 +76,21 @@ async function logAction(
   adminEmail: string,
   detail: unknown
 ): Promise<void> {
-  const db = supabaseAdmin();
-  await db.from("admin_actions").insert({
-    block_id: blockId,
-    action,
-    admin_email: adminEmail,
-    detail: detail ?? {},
-  });
+  const sql = db();
+  await sql`
+    insert into admin_actions (block_id, action, admin_email, detail)
+    values (${blockId}::uuid, ${action}, ${adminEmail}, ${sql.json((detail ?? {}) as never)})`;
 }
 
 // Default action — art comes down, the square stays sold/owned, no money moves.
 export async function removeBlock(blockId: string, adminEmail: string): Promise<void> {
-  const db = supabaseAdmin();
-  const { error } = await db.from("blocks").update({ status: "removed" }).eq("id", blockId);
-  if (error) throw error;
+  const sql = db();
+  await sql`update blocks set status = 'removed' where id = ${blockId}::uuid`;
   await logAction(blockId, "remove", adminEmail, { at: "removed" });
 }
 
 // ---- Funnel review (applications) ----
 
-// Approve a submission so the artist can place + publish. Emails their link.
 export async function approveSubmission(applicationId: string, adminEmail: string): Promise<boolean> {
   const ok = await approveApplication(applicationId, adminEmail);
   if (!ok) return false;
@@ -92,7 +102,6 @@ export async function approveSubmission(applicationId: string, adminEmail: strin
   return true;
 }
 
-// Reject a submission: refund the payment (Square/PayPal) and email the artist.
 export async function rejectSubmission(
   applicationId: string,
   adminEmail: string,
@@ -129,7 +138,6 @@ export async function refundAndRelease(blockId: string, adminEmail: string): Pro
       await refundPaypalCapture(block.payment_ref, block.amount_cents);
     }
   }
-  // Log before releasing so the block_id is captured in the audit row.
   await logAction(blockId, "refund_release", adminEmail, {
     provider: block.payment_provider,
     amountCents: block.amount_cents,

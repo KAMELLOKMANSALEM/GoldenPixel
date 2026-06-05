@@ -1,7 +1,5 @@
-// Server-side data access for blocks + occupancy. All functions use the service-role
-// client and are safe to call from API routes and Server Components only.
-
-import { supabaseAdmin } from "./supabase/admin";
+// Server-side data access for blocks + occupancy, on Replit PostgreSQL.
+import { db, norm } from "./db";
 import type { Block, PublicBlock, Cell } from "./types";
 import type { BlockSize, BlockShape } from "./config";
 
@@ -49,9 +47,6 @@ function rowToBlock(r: BlockRow): Block {
 }
 
 function rowToPublic(r: BlockRow): PublicBlock {
-  // Only PAID (sold + live) blocks show art publicly. Reserved-but-unpaid blocks
-  // occupy the wall as blank cells — their uploaded art must not leak before
-  // payment. Removed blocks also show blank.
   const reveal = r.state === "sold" && r.status === "live";
   return {
     id: r.id,
@@ -66,43 +61,31 @@ function rowToPublic(r: BlockRow): PublicBlock {
   };
 }
 
-// Free any reservations whose timer has elapsed. Cheap to call before reads.
 export async function sweepExpired(): Promise<number> {
-  const db = supabaseAdmin();
-  const { data, error } = await db.rpc("sweep_expired_reservations");
-  if (error) {
-    console.error("sweepExpired failed", error);
+  try {
+    const sql = db();
+    const [r] = await sql`select sweep_expired_reservations() as n`;
+    return (r?.n as number) ?? 0;
+  } catch (e) {
+    console.error("sweepExpired failed", e);
     return 0;
   }
-  return (data as number) ?? 0;
 }
 
-// Everything that occupies the wall: sold (live or removed) + active reservations.
-// Used to render the wall. Reserved blocks render as occupied-but-blank.
 export async function getWallBlocks(): Promise<PublicBlock[]> {
   await sweepExpired();
-  const db = supabaseAdmin();
-  const { data, error } = await db
-    .from("blocks")
-    .select(
-      "id,squares,size,shape,image_url,cell_images,caption,link_url,state,status,reserved_until,original_image_url,owner_email,flagged,moderation,amount_cents,payment_provider,payment_ref,edit_token,created_at,paid_at"
-    )
-    .or("state.eq.sold,state.eq.reserved");
-  if (error) throw error;
-  return (data as BlockRow[]).map(rowToPublic);
+  const sql = db();
+  const rows = await sql`select * from blocks where state in ('sold','reserved')`;
+  return norm<BlockRow>(rows).map(rowToPublic);
 }
 
-// The set of taken cells for placement validity: sold + reserved + blocked.
 export async function getOccupiedCells(): Promise<Cell[]> {
   await sweepExpired();
-  const db = supabaseAdmin();
-  const { data, error } = await db.from("occupied_squares").select("row,col");
-  if (error) throw error;
-  return data as Cell[];
+  const sql = db();
+  const rows = await sql`select row, col from occupied_squares`;
+  return rows.map((r) => ({ row: r.row as number, col: r.col as number }));
 }
 
-// Atomic reservation via the Postgres function. Returns the created Block or
-// throws on cell conflict (someone else grabbed an overlapping cell first).
 export async function reserveBlock(params: {
   cells: Cell[];
   size: BlockSize;
@@ -110,113 +93,88 @@ export async function reserveBlock(params: {
   amountCents: number;
   minutes: number;
 }): Promise<{ ok: true; block: Block } | { ok: false; reason: "conflict" | "error" }> {
-  const db = supabaseAdmin();
-  const { data, error } = await db.rpc("reserve_block", {
-    p_cells: params.cells,
-    p_size: params.size,
-    p_shape: params.shape,
-    p_amount: params.amountCents,
-    p_minutes: params.minutes,
-  });
-  if (error) {
-    // 23505 = unique_violation => a cell was already taken.
-    if ((error as { code?: string }).code === "23505") return { ok: false, reason: "conflict" };
-    console.error("reserveBlock failed", error);
+  const sql = db();
+  try {
+    const rows = await sql`
+      select * from reserve_block(
+        ${JSON.stringify(params.cells)}::jsonb,
+        ${params.size}::smallint,
+        ${params.shape},
+        ${params.amountCents}::int,
+        ${params.minutes}::int
+      )`;
+    const block = norm<BlockRow>(rows)[0];
+    if (!block?.id) return { ok: false, reason: "error" };
+    return { ok: true, block: rowToBlock(block) };
+  } catch (e) {
+    if ((e as { code?: string }).code === "23505") return { ok: false, reason: "conflict" };
+    console.error("reserveBlock failed", e);
     return { ok: false, reason: "error" };
   }
-  return { ok: true, block: rowToBlock(data as BlockRow) };
 }
 
 export async function getBlock(id: string): Promise<Block | null> {
-  const db = supabaseAdmin();
-  const { data, error } = await db.from("blocks").select("*").eq("id", id).maybeSingle();
-  if (error) throw error;
-  return data ? rowToBlock(data as BlockRow) : null;
+  const sql = db();
+  const rows = await sql`select * from blocks where id = ${id}::uuid`;
+  const r = norm<BlockRow>(rows)[0];
+  return r ? rowToBlock(r) : null;
 }
 
 export async function getBlockRaw(id: string): Promise<BlockRow | null> {
-  const db = supabaseAdmin();
-  const { data, error } = await db.from("blocks").select("*").eq("id", id).maybeSingle();
-  if (error) throw error;
-  return (data as BlockRow) ?? null;
+  const sql = db();
+  const rows = await sql`select * from blocks where id = ${id}::uuid`;
+  return norm<BlockRow>(rows)[0] ?? null;
 }
 
 export async function getBlockByPaymentRef(ref: string): Promise<BlockRow | null> {
-  const db = supabaseAdmin();
-  const { data, error } = await db
-    .from("blocks")
-    .select("*")
-    .eq("payment_ref", ref)
-    .maybeSingle();
-  if (error) throw error;
-  return (data as BlockRow) ?? null;
+  const sql = db();
+  const rows = await sql`select * from blocks where payment_ref = ${ref}`;
+  return norm<BlockRow>(rows)[0] ?? null;
 }
 
-// Attach the uploaded art to a still-reserved block (step 4).
 export async function attachImage(
   id: string,
-  fields: {
-    imageUrl: string;
-    originalImageUrl: string;
-    flagged: boolean;
-    moderation: unknown;
-  }
+  fields: { imageUrl: string; originalImageUrl: string; flagged: boolean; moderation: unknown }
 ): Promise<boolean> {
-  const db = supabaseAdmin();
-  const { data, error } = await db
-    .from("blocks")
-    .update({
-      image_url: fields.imageUrl,
-      original_image_url: fields.originalImageUrl,
-      flagged: fields.flagged,
-      moderation: fields.moderation,
-    })
-    .eq("id", id)
-    .eq("state", "reserved")
-    .select("id");
-  if (error) throw error;
-  return (data?.length ?? 0) > 0; // false if the reservation no longer exists
+  const sql = db();
+  const rows = await sql`
+    update blocks set
+      image_url = ${fields.imageUrl},
+      original_image_url = ${fields.originalImageUrl},
+      flagged = ${fields.flagged},
+      moderation = ${sql.json(fields.moderation as never)}
+    where id = ${id}::uuid and state = 'reserved'
+    returning id`;
+  return rows.length > 0;
 }
 
-// Attach caption / link / owner email (step 5).
 export async function attachDetails(
   id: string,
   fields: { caption: string | null; linkUrl: string | null; ownerEmail: string }
 ): Promise<boolean> {
-  const db = supabaseAdmin();
-  const { data, error } = await db
-    .from("blocks")
-    .update({
-      caption: fields.caption,
-      link_url: fields.linkUrl,
-      owner_email: fields.ownerEmail,
-    })
-    .eq("id", id)
-    .eq("state", "reserved")
-    .select("id");
-  if (error) throw error;
-  return (data?.length ?? 0) > 0;
+  const sql = db();
+  const rows = await sql`
+    update blocks set
+      caption = ${fields.caption},
+      link_url = ${fields.linkUrl},
+      owner_email = ${fields.ownerEmail}
+    where id = ${id}::uuid and state = 'reserved'
+    returning id`;
+  return rows.length > 0;
 }
 
-// Confirm payment (webhook / server capture only). Returns block or null if it
-// could not be honored (expired & cells gone) — caller should refund.
 export async function confirmPaid(
   id: string,
   provider: "square" | "paypal",
   ref: string
 ): Promise<Block | null> {
-  const db = supabaseAdmin();
-  const { data, error } = await db.rpc("confirm_block_paid", {
-    p_block_id: id,
-    p_provider: provider,
-    p_ref: ref,
-  });
-  if (error) throw error;
-  return data ? rowToBlock(data as BlockRow) : null;
+  const sql = db();
+  const rows = await sql`select * from confirm_block_paid(${id}::uuid, ${provider}, ${ref})`;
+  const r = norm<BlockRow>(rows)[0];
+  return r?.id ? rowToBlock(r) : null;
 }
 
-// Owner edit: replace one cell's image on a sold block. Keeps a representative
-// thumbnail in image_url and accumulates flagged state for re-review.
+// Owner swaps one cell's image on a sold block (per-cell edit grid).
 export async function setBlockCellImage(
   blockId: string,
   cellIndex: number,
@@ -225,7 +183,7 @@ export async function setBlockCellImage(
   cellFlagged: boolean
 ): Promise<boolean> {
   const block = await getBlockRaw(blockId);
-  if (!block) return false;
+  if (!block || block.state !== "sold") return false;
   if (cellIndex < 0 || cellIndex >= total) return false;
   const arr: (string | null)[] = Array.isArray(block.cell_images)
     ? [...(block.cell_images as (string | null)[])]
@@ -233,27 +191,23 @@ export async function setBlockCellImage(
   while (arr.length < total) arr.push(null);
   arr[cellIndex] = url;
   const firstFilled = arr.find((u) => !!u) || url;
-  const db = supabaseAdmin();
-  const { error } = await db
-    .from("blocks")
-    .update({ cell_images: arr, image_url: firstFilled, flagged: block.flagged || cellFlagged })
-    .eq("id", blockId);
-  if (error) throw error;
+  const sql = db();
+  await sql`
+    update blocks set
+      cell_images = ${sql.json(arr as never)},
+      image_url = ${firstFilled},
+      flagged = ${block.flagged || cellFlagged}
+    where id = ${blockId}::uuid`;
   return true;
 }
 
 export async function setEditToken(id: string, token: string): Promise<void> {
-  const db = supabaseAdmin();
-  const { error } = await db.from("blocks").update({ edit_token: token }).eq("id", id);
-  if (error) throw error;
+  const sql = db();
+  await sql`update blocks set edit_token = ${token} where id = ${id}::uuid`;
 }
 
 export async function countSold(): Promise<number> {
-  const db = supabaseAdmin();
-  const { count, error } = await db
-    .from("blocks")
-    .select("id", { count: "exact", head: true })
-    .eq("state", "sold");
-  if (error) throw error;
-  return count ?? 0;
+  const sql = db();
+  const [r] = await sql`select count(*)::int as count from blocks where state = 'sold'`;
+  return (r?.count as number) ?? 0;
 }
